@@ -154,6 +154,39 @@ class FastSam3DNode(Node):
         self.smoothed_size = None
         self.is_processing = False  # 연산 밀림 방지용 락
 
+        # 가림/군집/추적/지연 대응 파라미터
+        self.declare_parameter('use_ransac_sphere', True)
+        self.declare_parameter('ransac_iterations', 120)
+        self.declare_parameter('ransac_inlier_threshold', 0.012)  # meter
+        self.declare_parameter('sphere_min_radius', 0.015)        # meter
+        self.declare_parameter('sphere_max_radius', 0.12)         # meter
+        self.declare_parameter('use_euclidean_clustering', True)
+        self.declare_parameter('cluster_eps', 0.015)              # meter
+        self.declare_parameter('cluster_min_points', 30)
+        self.declare_parameter('use_kalman_filter', True)
+        self.declare_parameter('kf_process_noise', 1e-3)
+        self.declare_parameter('kf_measurement_noise', 2e-2)
+        self.declare_parameter('size_ema_alpha', 0.5)
+        self.declare_parameter('max_points_for_3d', 12000)
+        self.declare_parameter('use_torch_projection', True)
+
+        self.use_ransac_sphere = self.get_parameter('use_ransac_sphere').get_parameter_value().bool_value
+        self.ransac_iterations = int(self.get_parameter('ransac_iterations').get_parameter_value().integer_value)
+        self.ransac_inlier_threshold = float(self.get_parameter('ransac_inlier_threshold').get_parameter_value().double_value)
+        self.sphere_min_radius = float(self.get_parameter('sphere_min_radius').get_parameter_value().double_value)
+        self.sphere_max_radius = float(self.get_parameter('sphere_max_radius').get_parameter_value().double_value)
+        self.use_euclidean_clustering = self.get_parameter('use_euclidean_clustering').get_parameter_value().bool_value
+        self.cluster_eps = float(self.get_parameter('cluster_eps').get_parameter_value().double_value)
+        self.cluster_min_points = int(self.get_parameter('cluster_min_points').get_parameter_value().integer_value)
+        self.use_kalman_filter = self.get_parameter('use_kalman_filter').get_parameter_value().bool_value
+        self.kf_process_noise = float(self.get_parameter('kf_process_noise').get_parameter_value().double_value)
+        self.kf_measurement_noise = float(self.get_parameter('kf_measurement_noise').get_parameter_value().double_value)
+        self.size_ema_alpha = float(self.get_parameter('size_ema_alpha').get_parameter_value().double_value)
+        self.max_points_for_3d = int(self.get_parameter('max_points_for_3d').get_parameter_value().integer_value)
+        self.use_torch_projection = self.get_parameter('use_torch_projection').get_parameter_value().bool_value
+
+        self.kalman = None
+
         self.get_logger().info('FastSam3DNode 시작')
 
     # --- 콜백들 ---
@@ -173,6 +206,7 @@ class FastSam3DNode(Node):
         # === [추가된 부분] 타겟이 바뀌면 스무딩 값도 리셋 ===
         self.smoothed_center = None
         self.smoothed_size = None
+        self.kalman = None
 
     def rgb_callback(self, msg: Image):
         if self.is_processing:
@@ -225,19 +259,9 @@ class FastSam3DNode(Node):
         # 6) mask + depth + CameraInfo 로 3D 포인트 & Bounding Box 계산 (카메라 프레임)
         bbox_center, bbox_size = self.compute_3d_bbox(mask, self.last_depth, self.last_camera_info)
 
-        # === [추가된 부분] EMA(지수 이동 평균) 필터 적용 - 덜덜거림 완벽 방지 ===
-        # 의미 있는 값이 나왔을 때만 필터 적용
+        # 시간축 필터 (Kalman + EMA)
         if np.any(bbox_size > 0):
-            if self.smoothed_center is None:
-                self.smoothed_center = bbox_center
-                self.smoothed_size = bbox_size
-            else:
-                self.smoothed_center = self.ema_alpha * bbox_center + (1.0 - self.ema_alpha) * self.smoothed_center
-                self.smoothed_size = self.ema_alpha * bbox_size + (1.0 - self.ema_alpha) * self.smoothed_size
-            
-            # 부드러워진 값으로 덮어쓰기
-            bbox_center = self.smoothed_center
-            bbox_size = self.smoothed_size
+            bbox_center, bbox_size = self.apply_temporal_filter(bbox_center, bbox_size)
         else:
             return # 박스 계산 실패 시 프레임 스킵
 
@@ -563,6 +587,25 @@ class FastSam3DNode(Node):
         ys, xs = np.where(valid)
         zs = depth[ys, xs]
 
+        # 지연 최소화를 위해 점 수 상한 적용
+        if self.max_points_for_3d > 0 and zs.shape[0] > self.max_points_for_3d:
+            sel = np.random.choice(zs.shape[0], self.max_points_for_3d, replace=False)
+            xs = xs[sel]
+            ys = ys[sel]
+            zs = zs[sel]
+
+        if self.use_torch_projection and self.device == 'cuda' and torch.cuda.is_available():
+            try:
+                xs_t = torch.as_tensor(xs, device='cuda', dtype=torch.float32)
+                ys_t = torch.as_tensor(ys, device='cuda', dtype=torch.float32)
+                zs_t = torch.as_tensor(zs, device='cuda', dtype=torch.float32)
+                xs_3d_t = (xs_t - float(cx)) * zs_t / float(fx)
+                ys_3d_t = (ys_t - float(cy)) * zs_t / float(fy)
+                points = torch.stack([xs_3d_t, ys_3d_t, zs_t], dim=-1).detach().cpu().numpy()
+                return self.estimate_spherical_bbox(points)
+            except Exception as e:
+                self.get_logger().warn(f'Torch projection 실패, numpy 경로로 fallback: {e}')
+
         xs_3d = (xs - cx) * zs / fx
         ys_3d = (ys - cy) * zs / fy
 
@@ -594,6 +637,19 @@ class FastSam3DNode(Node):
         if filtered.shape[0] < 6:
             return self.aabb_center_and_size(filtered)
 
+        # 복수 토마토가 섞인 경우, 가장 큰 밀집 군집만 선택
+        filtered = self.select_largest_cluster(filtered)
+        if filtered.shape[0] < 6:
+            return self.aabb_center_and_size(filtered)
+
+        # 가림(occlusion) 대응: RANSAC 구 피팅 우선
+        if self.use_ransac_sphere:
+            center_ransac, radius_ransac = self.fit_sphere_ransac(filtered)
+            if center_ransac is not None and radius_ransac is not None:
+                diameter = 2.0 * radius_ransac
+                size = np.array([diameter, diameter, diameter], dtype=float)
+                return center_ransac.astype(float), size
+
         # 1. [핵심 개선] 중앙값(Median)으로 오차 없는 중심점 찾기
         # 한쪽으로 치우친 줄기 데이터를 무시하고 덩어리의 정중앙을 타겟팅합니다.
         center = np.median(filtered, axis=0)
@@ -612,6 +668,156 @@ class FastSam3DNode(Node):
         diameter = 2.0 * radius
         size = np.array([diameter, diameter, diameter], dtype=float)
         return center.astype(float), size
+
+    def select_largest_cluster(self, points):
+        if (not self.use_euclidean_clustering) or points.shape[0] < max(20, self.cluster_min_points):
+            return points
+        if o3d is None:
+            return points
+        try:
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
+            labels = np.array(
+                pcd.cluster_dbscan(
+                    eps=self.cluster_eps,
+                    min_points=self.cluster_min_points,
+                    print_progress=False
+                )
+            )
+            valid = labels >= 0
+            if not np.any(valid):
+                return points
+            uniq, counts = np.unique(labels[valid], return_counts=True)
+            main_label = uniq[np.argmax(counts)]
+            clustered = points[labels == main_label]
+            if clustered.shape[0] < 6:
+                return points
+            return clustered
+        except Exception as e:
+            self.get_logger().warn(f'클러스터링 실패, 원본 점 사용: {e}')
+            return points
+
+    def fit_sphere_ransac(self, points):
+        if points.shape[0] < 6:
+            return None, None
+        best_inliers = None
+        best_count = 0
+
+        for _ in range(max(1, self.ransac_iterations)):
+            ids = np.random.choice(points.shape[0], 4, replace=False)
+            c, r = self.sphere_from_points_4(points[ids])
+            if c is None or r is None:
+                continue
+            if not (self.sphere_min_radius <= r <= self.sphere_max_radius):
+                continue
+
+            d = np.linalg.norm(points - c, axis=1)
+            inliers = np.abs(d - r) <= self.ransac_inlier_threshold
+            count = int(np.count_nonzero(inliers))
+            if count > best_count:
+                best_count = count
+                best_inliers = inliers
+
+        if best_inliers is None or best_count < 6:
+            return None, None
+
+        c_refit, r_refit = self.sphere_from_points_ls(points[best_inliers])
+        if c_refit is None or r_refit is None:
+            return None, None
+        if not (self.sphere_min_radius <= r_refit <= self.sphere_max_radius):
+            return None, None
+        return c_refit, r_refit
+
+    def sphere_from_points_4(self, pts4):
+        try:
+            p1, p2, p3, p4 = pts4
+            a = 2.0 * np.array([p2 - p1, p3 - p1, p4 - p1], dtype=float)
+            b = np.array([
+                np.dot(p2, p2) - np.dot(p1, p1),
+                np.dot(p3, p3) - np.dot(p1, p1),
+                np.dot(p4, p4) - np.dot(p1, p1),
+            ], dtype=float)
+            if abs(np.linalg.det(a)) < 1e-10:
+                return None, None
+            c = np.linalg.solve(a, b)
+            r = float(np.linalg.norm(p1 - c))
+            if not np.isfinite(r) or r <= 0.0:
+                return None, None
+            return c.astype(float), r
+        except Exception:
+            return None, None
+
+    def sphere_from_points_ls(self, points):
+        try:
+            a = np.column_stack((2.0 * points, np.ones(points.shape[0], dtype=float)))
+            b = np.sum(points * points, axis=1)
+            x, *_ = np.linalg.lstsq(a, b, rcond=None)
+            c = x[:3]
+            c0 = float(x[3])
+            r2 = float(np.dot(c, c) + c0)
+            if r2 <= 0.0:
+                return None, None
+            r = float(np.sqrt(r2))
+            if not np.isfinite(r):
+                return None, None
+            return c.astype(float), r
+        except Exception:
+            return None, None
+
+    def init_kalman_if_needed(self, center):
+        if self.kalman is not None:
+            return
+        kf = cv2.KalmanFilter(6, 3)
+        dt = 1.0 / 30.0
+        kf.transitionMatrix = np.array([
+            [1, 0, 0, dt, 0, 0],
+            [0, 1, 0, 0, dt, 0],
+            [0, 0, 1, 0, 0, dt],
+            [0, 0, 0, 1, 0, 0],
+            [0, 0, 0, 0, 1, 0],
+            [0, 0, 0, 0, 0, 1],
+        ], dtype=np.float32)
+        kf.measurementMatrix = np.array([
+            [1, 0, 0, 0, 0, 0],
+            [0, 1, 0, 0, 0, 0],
+            [0, 0, 1, 0, 0, 0],
+        ], dtype=np.float32)
+        kf.processNoiseCov = np.eye(6, dtype=np.float32) * np.float32(self.kf_process_noise)
+        kf.measurementNoiseCov = np.eye(3, dtype=np.float32) * np.float32(self.kf_measurement_noise)
+        kf.errorCovPost = np.eye(6, dtype=np.float32)
+        kf.statePost = np.array([
+            [center[0]], [center[1]], [center[2]], [0.0], [0.0], [0.0]
+        ], dtype=np.float32)
+        self.kalman = kf
+
+    def apply_temporal_filter(self, bbox_center, bbox_size):
+        center = bbox_center.astype(float)
+        size = bbox_size.astype(float)
+
+        if self.use_kalman_filter:
+            self.init_kalman_if_needed(center)
+            pred = self.kalman.predict()
+            meas = np.array([[center[0]], [center[1]], [center[2]]], dtype=np.float32)
+            corr = self.kalman.correct(meas)
+            center = np.array([corr[0, 0], corr[1, 0], corr[2, 0]], dtype=float)
+
+            # Kalman 예측값과 보정값을 EMA로 한 번 더 안정화
+            pred_center = np.array([pred[0, 0], pred[1, 0], pred[2, 0]], dtype=float)
+            center = self.ema_alpha * center + (1.0 - self.ema_alpha) * pred_center
+        else:
+            if self.smoothed_center is None:
+                self.smoothed_center = center.copy()
+            else:
+                self.smoothed_center = self.ema_alpha * center + (1.0 - self.ema_alpha) * self.smoothed_center
+            center = self.smoothed_center
+
+        if self.smoothed_size is None:
+            self.smoothed_size = size.copy()
+        else:
+            self.smoothed_size = self.size_ema_alpha * size + (1.0 - self.size_ema_alpha) * self.smoothed_size
+        size = self.smoothed_size
+
+        return center, size
 
     def robust_radius_from_distances(self, distances):
         """

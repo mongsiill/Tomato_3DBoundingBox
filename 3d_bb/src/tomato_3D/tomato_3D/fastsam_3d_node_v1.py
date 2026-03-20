@@ -1,222 +1,232 @@
 #!/usr/bin/env python3
 
-# FastSAM 및 Fast-FoundationStereo 적용 버전
+#FastSAM 사용
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 
 from sensor_msgs.msg import Image, CameraInfo
 from visualization_msgs.msg import Marker
-from geometry_msgs.msg import Polygon, Point32
+from geometry_msgs.msg import Polygon  # 2D box 표현용
+from geometry_msgs.msg import Point32
 from cv_bridge import CvBridge
 import numpy as np
 import cv2
-import message_filters  # === [추가됨] 좌/우 이미지 동기화용 ===
 
 try:
     import open3d as o3d
 except Exception:
+    # Open3D가 설치되어 있어도, numpy/scipy/sklearn ABI 충돌 등으로 import 단계에서
+    # ImportError가 아닌 예외가 발생할 수 있어 안전하게 비활성화한다.
     o3d = None
 
-import sys
 import torch
 from ultralytics import FastSAM, YOLO
-import torch.nn.functional as F  # 패딩(Padding) 처리를 위해 필요
-
-# === Fast-FoundationStereo 폴더 경로 강제 추가 ===
-sys.path.append('/home/user/projects/Fast-FoundationStereo')
-# 원작자가 만든 패딩 도구 임포트
-from core.utils.utils import InputPadder
-
-# === [주의] Fast-FoundationStereo Repo를 클론한 경로에 맞춰 import 하세요 ===
-# sys.path.append('/home/user/projects/Fast-FoundationStereo')
-# from models.stereo_model import FastFoundationStereo  <-- (가상의 import 예시)
 
 
 class FastSam3DNode(Node):
     def __init__(self):
         super().__init__('fastsam_3d_node')
 
-        # === 1. 모델 설정 (FastSAM + Fast-FoundationStereo) ===
+        # Ultralytics SAM/SAM2 설정
         self.declare_parameter('sam_model_path', '/home/user/projects/Tomato_3DBoundingBox/3d_bb/src/tomato_3D/resource/FastSAM-s.pt')
-        self.declare_parameter('sam_device', 'cuda')
+        self.declare_parameter('sam_device', 'cuda')  # auto / cpu / cuda
         self.declare_parameter('sam_imgsz', 1024)
-        
-        # Fast-FoundationStereo 가중치 파일 경로
-        self.declare_parameter('stereo_model_path', '/home/user/projects/Fast-FoundationStereo/weights/20-26-39/model_best_bp2_serialize.pth')
-        # ZED 2i 카메라의 두 렌즈 사이 실제 거리 (Baseline, 단위: 미터)
-        self.declare_parameter('camera_baseline', 0.12)
 
+        self.sam_model_path = self.get_parameter('sam_model_path').get_parameter_value().string_value
         self.sam_device_param = self.get_parameter('sam_device').get_parameter_value().string_value
-        self.device = 'cuda' if self.sam_device_param == 'auto' and torch.cuda.is_available() else self.sam_device_param
         self.sam_imgsz = self.get_parameter('sam_imgsz').get_parameter_value().integer_value
-        self.camera_baseline = self.get_parameter('camera_baseline').get_parameter_value().double_value
 
-        # FastSAM 로드
+        if self.sam_device_param == 'auto':
+            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        else:
+            self.device = self.sam_device_param
+
         try:
-            self.sam_model = FastSAM(self.get_parameter('sam_model_path').get_parameter_value().string_value)
-            self.get_logger().info('Ultralytics FastSAM loaded')
+            self.sam_model = FastSAM(self.sam_model_path)
+            self.get_logger().info(
+                f'Ultralytics FastSAM loaded: {self.sam_model_path} on {self.device}'
+            )
         except Exception as e:
             self.sam_model = None
             self.get_logger().error(f'FastSAM 로드 실패: {e}')
 
-        # Fast-FoundationStereo 로드
-        try:
-            stereo_weights = self.get_parameter('stereo_model_path').get_parameter_value().string_value
-            
-            # run_demo.py 방식대로 통째로 로드
-            self.stereo_model = torch.load(stereo_weights, map_location='cpu', weights_only=False)
-            
-            # 파라미터 세팅 (run_demo.py 기본값 적용)
-            self.stereo_model.args.valid_iters = 4
-            self.stereo_model.args.max_disp = 192
-            
-            self.stereo_model = self.stereo_model.to(self.device).eval()
-            self.get_logger().info('Fast-FoundationStereo 로드 완료!')
-        except Exception as e:
-            self.stereo_model = None
-            self.get_logger().error(f'Stereo Model 로드 실패: {e}')
-
-        # === 2. YOLO 설정 ===
-        self.declare_parameter('tracking_mode', 'yolo')
+        # YOLO tracking 설정 (detect+track)
+        self.declare_parameter('tracking_mode', 'yolo')  # yolo | csrt
         self.declare_parameter('yolo_model_path', '/home/user/projects/Tomato_3DBoundingBox/3d_bb/src/tomato_3D/resource/best.pt')
-        self.declare_parameter('yolo_tracker', 'bytetrack.yaml')
+        self.declare_parameter('yolo_tracker', 'bytetrack.yaml')  # bytetrack.yaml | botsort.yaml
         self.declare_parameter('yolo_conf', 0.25)
         self.declare_parameter('yolo_iou', 0.45)
+        self.declare_parameter('yolo_classes', [])  # 예: [0] 처럼 클래스 필터. 비우면 전체.
 
         self.tracking_mode = self.get_parameter('tracking_mode').get_parameter_value().string_value
         self.yolo_model_path = self.get_parameter('yolo_model_path').get_parameter_value().string_value
         self.yolo_tracker = self.get_parameter('yolo_tracker').get_parameter_value().string_value
         self.yolo_conf = float(self.get_parameter('yolo_conf').get_parameter_value().double_value)
         self.yolo_iou = float(self.get_parameter('yolo_iou').get_parameter_value().double_value)
+        # classes는 ParameterValue 타입 제약이 있어 string_array로 받는 경우가 많아서, 여기서는 단순하게 미사용 기본
+        self.yolo_classes = None
 
         self.yolo_model = None
         self.target_track_id = None
-        self.target_bbox_xyxy = None
+        self.target_bbox_xyxy = None  # last bbox in xyxy
 
         if self.tracking_mode == 'yolo':
             try:
                 self.yolo_model = YOLO(self.yolo_model_path)
-                self.get_logger().info('YOLO loaded')
+                self.get_logger().info(f'YOLO loaded: {self.yolo_model_path} tracker={self.yolo_tracker}')
             except Exception as e:
                 self.yolo_model = None
                 self.get_logger().error(f'YOLO 로드 실패: {e}')
 
-        # === 3. 통신 및 상태 변수 ===
-        self.bridge = CvBridge()
-        self.last_box2d = None
-        
-        self.declare_parameter('ema_alpha', 0.6)
-        self.ema_alpha = float(self.get_parameter('ema_alpha').get_parameter_value().double_value)
-        self.smoothed_center = None
-        self.smoothed_size = None
-        self.is_processing = False
+        # ZED 토픽에 맞는 QoS (센서 데이터)
+        sensor_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=10,
+        )
 
-        # === 4. ROS 2 토픽 변경 (좌/우 이미지 구독) ===
-        # ZED에서 뎁스를 받지 않고, Rectified 된 왼쪽/오른쪽 이미지를 직접 받습니다.
-        self.declare_parameter('left_topic', '/zed/zed_node/left/color/rect/image')
-        self.declare_parameter('right_topic', '/zed/zed_node/right/color/rect/image')
-        self.declare_parameter('camera_info_topic', '/zed/zed_node/left/color/rect/camera_info')
+        self.bridge = CvBridge()
+        self.last_camera_info = None
+        self.last_box2d = None  # 초기 bbox(1회 입력) 또는 재초기화용
+        self.last_rgb = None
+        self.last_depth = None
+
+        # OpenCV CSRT tracker 상태
+        self.tracker = None
+        self.tracker_initialized = False
+        self.tracker_bbox_xywh = None  # (x, y, w, h) in pixels
+        self.declare_parameter('csrt_min_size', 80)
+        self.declare_parameter('csrt_init_expand', 2.0)
+        self.csrt_min_size = int(self.get_parameter('csrt_min_size').get_parameter_value().integer_value)
+        self.csrt_init_expand = float(self.get_parameter('csrt_init_expand').get_parameter_value().double_value)
+
+        # 파라미터: 기본값을 ZED Wrapper 기준으로 둠
+        self.declare_parameter('rgb_topic', '/zed/zed_node/rgb/color/rect/image')
+        self.declare_parameter('depth_topic', '/zed/zed_node/depth/depth_registered')
+        self.declare_parameter('camera_info_topic', '/zed/zed_node/rgb/color/rect/camera_info')
+        # 초기 bbox 입력(한 번만). 필요하면 재발행해서 tracker를 재초기화 가능
         self.declare_parameter('init_box2d_topic', '/tomato/box2d')
         self.declare_parameter('track_box2d_topic', '/tomato/track_box2d')
         self.declare_parameter('bbox3d_topic', '/tomato/box3d')
+        self.declare_parameter('use_csrt_tracker', True)  # tracking_mode=csrt 일 때만 의미 있음
 
-        left_topic = self.get_parameter('left_topic').get_parameter_value().string_value
-        right_topic = self.get_parameter('right_topic').get_parameter_value().string_value
+        rgb_topic = self.get_parameter('rgb_topic').get_parameter_value().string_value
+        depth_topic = self.get_parameter('depth_topic').get_parameter_value().string_value
         camera_info_topic = self.get_parameter('camera_info_topic').get_parameter_value().string_value
         init_box2d_topic = self.get_parameter('init_box2d_topic').get_parameter_value().string_value
-        
-        # Bbox 및 발행
-        self.init_box2d_sub = self.create_subscription(Polygon, init_box2d_topic, self.box2d_callback, 10)
-        self.bbox3d_pub = self.create_publisher(Marker, self.get_parameter('bbox3d_topic').get_parameter_value().string_value, 10)
-        self.track_box2d_pub = self.create_publisher(Polygon, self.get_parameter('track_box2d_topic').get_parameter_value().string_value, 10)
+        track_box2d_topic = self.get_parameter('track_box2d_topic').get_parameter_value().string_value
+        bbox3d_topic = self.get_parameter('bbox3d_topic').get_parameter_value().string_value
+        self.use_csrt_tracker = self.get_parameter('use_csrt_tracker').get_parameter_value().bool_value
 
+        # 구독
+        self.rgb_sub = self.create_subscription(
+            Image, rgb_topic, self.rgb_callback, sensor_qos
+        )
+        self.depth_sub = self.create_subscription(
+            Image, depth_topic, self.depth_callback, sensor_qos
+        )
+        self.caminfo_sub = self.create_subscription(
+            CameraInfo, camera_info_topic, self.camera_info_callback, 10
+        )
+        self.init_box2d_sub = self.create_subscription(
+            Polygon, init_box2d_topic, self.box2d_callback, 10
+        )
+
+        # 발행
+        self.bbox3d_pub = self.create_publisher(Marker, bbox3d_topic, 10)
+        self.track_box2d_pub = self.create_publisher(Polygon, track_box2d_topic, 10)
+
+        # mask 발행
         self.declare_parameter('mask_topic', '/tomato/mask')
         self.declare_parameter('mask_overlay_topic', '/tomato/mask_overlay')
-        self.mask_pub = self.create_publisher(Image, self.get_parameter('mask_topic').get_parameter_value().string_value, 10)
-        self.mask_overlay_pub = self.create_publisher(Image, self.get_parameter('mask_overlay_topic').get_parameter_value().string_value, 10)
 
-        self.depth_vis_pub = self.create_publisher(Image, '/tomato/depth_vis', 10)
+        mask_topic = self.get_parameter('mask_topic').get_parameter_value().string_value
+        mask_overlay_topic = self.get_parameter('mask_overlay_topic').get_parameter_value().string_value
 
-        sensor_qos = QoSProfile(reliability=QoSReliabilityPolicy.BEST_EFFORT, history=QoSHistoryPolicy.KEEP_LAST, depth=10)
+        self.mask_pub = self.create_publisher(Image, mask_topic, 10)
+        self.mask_overlay_pub = self.create_publisher(Image, mask_overlay_topic, 10)
 
-        # === [핵심] 좌우 카메라 동기화 (TimeSynchronizer) ===
-        self.left_sub = message_filters.Subscriber(self, Image, left_topic, qos_profile=sensor_qos)
-        self.right_sub = message_filters.Subscriber(self, Image, right_topic, qos_profile=sensor_qos)
-        self.info_sub = message_filters.Subscriber(self, CameraInfo, camera_info_topic)
+        # === [추가된 부분] 부드러운 3D 박스를 위한 스무딩 및 프레임 드랍 설정 ===
+        self.declare_parameter('ema_alpha', 0.6) # 0.0 ~ 1.0 (낮을수록 부드럽지만 반응이 느림, 높을수록 반응이 빠름)
+        self.ema_alpha = float(self.get_parameter('ema_alpha').get_parameter_value().double_value)
+        self.smoothed_center = None
+        self.smoothed_size = None
+        self.is_processing = False  # 연산 밀림 방지용 락
 
-        # 왼쪽, 오른쪽 이미지와 CameraInfo의 timestamp가 같은 것들만 묶어서 stereo_callback으로 보냅니다.
-        self.ts = message_filters.ApproximateTimeSynchronizer(
-            [self.left_sub, self.right_sub, self.info_sub], queue_size=10, slop=0.05
-        )
-        self.ts.registerCallback(self.stereo_callback)
-
-        self.get_logger().info('Sam3DNode 시작 (Fast-FoundationStereo 적용 모드)')
+        self.get_logger().info('FastSam3DNode 시작')
 
     # --- 콜백들 ---
 
+    def camera_info_callback(self, msg: CameraInfo):
+        self.last_camera_info = msg
+
     def box2d_callback(self, msg: Polygon):
+        # Polygon 점 4개를 [x_min, y_min, x_max, y_max] 로 변환한다고 가정
+        # 새 bbox가 들어오면 tracker를 재초기화할 수 있도록 저장
         self.last_box2d = msg
+        self.tracker_initialized = False
+        # YOLO tracking도 초기 bbox가 바뀌면 target을 다시 잡도록 리셋
         self.target_track_id = None
         self.target_bbox_xyxy = None
+
+        # === [추가된 부분] 타겟이 바뀌면 스무딩 값도 리셋 ===
         self.smoothed_center = None
         self.smoothed_size = None
 
-    def stereo_callback(self, left_msg: Image, right_msg: Image, info_msg: CameraInfo):
-        """
-        좌/우 이미지와 카메라 정보가 동시에 들어올 때 실행됩니다.
-        """
+    def rgb_callback(self, msg: Image):
         if self.is_processing:
             return
 
+        try:
+            img_bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            self.last_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        except Exception as e:
+            self.get_logger().error(f'RGB 변환 실패: {e}')
+            return
+
+        # RGB 도착 시마다 처리 시도
         self.is_processing = True
         try:
-            # 1. ROS 이미지를 CV2 (BGR -> RGB)로 변환
-            left_bgr = self.bridge.imgmsg_to_cv2(left_msg, desired_encoding='bgr8')
-            right_bgr = self.bridge.imgmsg_to_cv2(right_msg, desired_encoding='bgr8')
-            
-            left_rgb = cv2.cvtColor(left_bgr, cv2.COLOR_BGR2RGB)
-            right_rgb = cv2.cvtColor(right_bgr, cv2.COLOR_BGR2RGB)
-
-            # 메인 처리 로직 호출
-            self.try_process(left_msg.header, left_rgb, right_rgb, info_msg)
-
-        except Exception as e:
-            self.get_logger().error(f'Stereo callback 에러: {e}')
+            self.try_process(msg.header, img_bgr)
         finally:
-            self.is_processing = False
+            self.is_processing = False  # 연산 종료 후 락 해제
+
+    def depth_callback(self, msg: Image):
+        try:
+            depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='32FC1')
+            self.last_depth = depth
+        except Exception as e:
+            self.get_logger().error(f'Depth 변환 실패: {e}')
+            return
 
     # --- 메인 처리 ---
 
-    def try_process(self, header, left_rgb, right_rgb, cam_info: CameraInfo):
-        if self.last_box2d is None:
+    def try_process(self, header, img_bgr):
+        if self.last_rgb is None or self.last_depth is None:
+            return
+        if self.last_camera_info is None or self.last_box2d is None:
             return
 
-        # 1) YOLO 추적으로 현재 프레임(왼쪽 카메라 기준) 타겟 박스 찾기
-        img_bgr_for_yolo = cv2.cvtColor(left_rgb, cv2.COLOR_RGB2BGR)
-        x_min, y_min, x_max, y_max = self.get_current_bbox(img_bgr_for_yolo)
+        # 1) 현재 프레임에서 사용할 bbox를 결정 (YOLO track 우선, 아니면 CSRT, 아니면 초기 bbox)
+        x_min, y_min, x_max, y_max = self.get_current_bbox(img_bgr)
         if x_min is None:
             return
 
+        # 3-1) 추적 bbox 발행
         self.track_box2d_pub.publish(self.xyxy_to_polygon(x_min, y_min, x_max, y_max))
 
-        # === 2) Fast-FoundationStereo 로 Depth Map 생성 ===
-        depth_map = self.generate_depth_from_stereo(left_rgb, right_rgb, cam_info)
+        # 4) SAM/FastSAM 으로 mask 생성 (bbox prompt)
+        mask = self.run_fastsam(self.last_rgb, x_min, y_min, x_max, y_max)
 
-        if depth_map is None:
-            self.get_logger().warn('Depth 맵 생성 실패')
-            return
+        # 5) mask 시각화 토픽 발행
+        self.publish_mask_topics(mask, self.last_rgb, header)
 
-        # 3) SAM 2 로 mask 생성 (왼쪽 이미지 기준)
-        mask = self.run_sam(left_rgb, x_min, y_min, x_max, y_max)
-        self.publish_mask_topics(mask, left_rgb, header)
+        # 6) mask + depth + CameraInfo 로 3D 포인트 & Bounding Box 계산 (카메라 프레임)
+        bbox_center, bbox_size = self.compute_3d_bbox(mask, self.last_depth, self.last_camera_info)
 
-        # 4) mask + 딥러닝 depth + CameraInfo 로 3D Bounding Box 계산
-        bbox_center, bbox_size = self.compute_3d_bbox(mask, depth_map, cam_info)
-
-        self.get_logger().info(f'계산된 3D 박스 중심: {bbox_center}, 크기: {bbox_size}')
-
-        # 5) EMA 스무딩 필터 적용
+        # === [추가된 부분] EMA(지수 이동 평균) 필터 적용 - 덜덜거림 완벽 방지 ===
+        # 의미 있는 값이 나왔을 때만 필터 적용
         if np.any(bbox_size > 0):
             if self.smoothed_center is None:
                 self.smoothed_center = bbox_center
@@ -225,40 +235,27 @@ class FastSam3DNode(Node):
                 self.smoothed_center = self.ema_alpha * bbox_center + (1.0 - self.ema_alpha) * self.smoothed_center
                 self.smoothed_size = self.ema_alpha * bbox_size + (1.0 - self.ema_alpha) * self.smoothed_size
             
+            # 부드러워진 값으로 덮어쓰기
             bbox_center = self.smoothed_center
             bbox_size = self.smoothed_size
         else:
-            return 
+            return # 박스 계산 실패 시 프레임 스킵
 
-        # --- [여기에 디버깅/시각화 코드 추가!] ---
-        # 뎁스맵의 평균 거리를 로그로 찍어봅니다 (0.1m ~ 10m 사이의 유효한 값만)
-        valid_d = depth_map[(depth_map > 0.1) & (depth_map < 10.0)]
-        mean_d = valid_d.mean() if len(valid_d) > 0 else 0.0
-        self.get_logger().info(f'FFS 뎁스 생성 완료. 평균 거리: {mean_d:.2f}m')
-
-        # RViz에서 눈으로 보기 위해 뎁스 맵을 정규화(0~255)하여 토픽으로 쏩니다
-        disp_vis = cv2.normalize(depth_map, None, 255, 0, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-        disp_vis_color = cv2.applyColorMap(disp_vis, cv2.COLORMAP_TURBO)
-        depth_msg = self.bridge.cv2_to_imgmsg(disp_vis_color, encoding='bgr8')
-        depth_msg.header.stamp = header.stamp
-        depth_msg.header.frame_id = "zed_left_camera_optical_frame"
-        self.depth_vis_pub.publish(depth_msg)
-        # ----------------------------------------
-
-        # 6) Marker 발행
+        # 4) Marker 발행 (카메라 프레임 기준)
         marker = Marker()
         marker.header = header
-        marker.header.frame_id = "zed_left_camera_optical_frame" # "zed_left_camera_optical_frame" 등
+        # camera_info.header.frame_id 를 그대로 사용 (예: zed_camera_center)
+        marker.header.frame_id = "zed_left_camera_optical_frame"
 
         marker.ns = "tomato"
         marker.id = 0
-        marker.type = Marker.CUBE # 큐브 유지
+        marker.type = Marker.CUBE
         marker.action = Marker.ADD
 
         marker.pose.position.x = float(bbox_center[0])
         marker.pose.position.y = float(bbox_center[1])
         marker.pose.position.z = float(bbox_center[2])
-        marker.pose.orientation.w = 1.0  
+        marker.pose.orientation.w = 1.0  # 카메라 프레임 축 정렬
 
         marker.scale.x = float(bbox_size[0])
         marker.scale.y = float(bbox_size[1])
@@ -269,51 +266,12 @@ class FastSam3DNode(Node):
         marker.color.b = 0.0
         marker.color.a = 0.5
 
+        marker.lifetime.sec = 0
+        marker.lifetime.nanosec = 0
+
         self.bbox3d_pub.publish(marker)
-
-    def generate_depth_from_stereo(self, left_img, right_img, cam_info: CameraInfo):
-        if self.stereo_model is None:
-            return np.ones(left_img.shape[:2], dtype=np.float32)
-
-        try:
-            # 1. Numpy(H, W, C) -> PyTorch Tensor(B, C, H, W) 변환
-            # run_demo.py를 보면 0~255 스케일을 그대로 float으로 캐스팅만 합니다.
-            imgL = torch.as_tensor(left_img).float().to(self.device).unsqueeze(0).permute(0, 3, 1, 2)
-            imgR = torch.as_tensor(right_img).float().to(self.device).unsqueeze(0).permute(0, 3, 1, 2)
-
-            # 2. 원작자의 InputPadder를 이용해 32의 배수로 자동 패딩
-            padder = InputPadder(imgL.shape, divis_by=32, force_square=False)
-            imgL, imgR = padder.pad(imgL, imgR)
-
-            # 3. 모델 추론 (autocast로 속도 향상)
-            # AMP_DTYPE은 보통 torch.float16 을 의미합니다.
-            with torch.amp.autocast('cuda', enabled=True, dtype=torch.float16):
-                disp = self.stereo_model.forward(
-                    imgL, imgR, 
-                    iters=8, 
-                    test_mode=True, 
-                    optimize_build_volume='pytorch1'
-                )
-
-            # 4. 언패딩(원래 사이즈로 복구) 및 Numpy로 가져오기
-            disp = padder.unpad(disp.float())
-            disparity_map = disp.data.cpu().numpy().squeeze().clip(0, None)
-            H, W = left_img.shape[:2]
-            disparity_map = disparity_map.reshape(H, W)
-
-            # 5. Disparity(시차)를 Depth(미터)로 변환
-            K = np.array(cam_info.k).reshape(3, 3)
-            fx = K[0, 0] 
-            
-            disparity_map[disparity_map <= 0.01] = 0.01 
-            depth_map = (fx * self.camera_baseline) / disparity_map
-            
-            return depth_map.astype(np.float32)
-
-        except Exception as e:
-            self.get_logger().error(f'Depth 생성 실패: {e}')
-            return None
-
+        # 디버그용 로그
+        # self.get_logger().info(f'BBox center={bbox_center}, size={bbox_size}')
 
     def get_current_bbox(self, img_bgr):
         """
@@ -527,16 +485,16 @@ class FastSam3DNode(Node):
         y_min, y_max = min(ys), max(ys)
         return int(x_min), int(y_min), int(x_max), int(y_max)
 
-    def run_sam(self, rgb_img, x_min, y_min, x_max, y_max):
+    def run_fastsam(self, rgb_img, x_min, y_min, x_max, y_max):
         """
-        Ultralytics FastSAM 로 bbox prompt 기반 mask 생성
+        Ultralytics SAM/SAM2 로 bbox prompt 기반 mask 생성
         반환: bool mask (H, W)
         """
         h, w = rgb_img.shape[:2]
 
         # SAM 모델이 없으면 더미 mask로 fallback
         if self.sam_model is None:
-            self.get_logger().warn('FastSAM 모델이 없어 더미 mask 사용')
+            self.get_logger().warn('SAM 모델이 없어 더미 mask 사용')
             mask = np.zeros((h, w), dtype=bool)
             x_min = max(0, min(w, int(x_min)))
             x_max = max(0, min(w, int(x_max)))
@@ -557,7 +515,7 @@ class FastSam3DNode(Node):
             )
 
             if not results or results[0].masks is None:
-                self.get_logger().warn('FastSAM 결과가 비어 있음')
+                self.get_logger().warn('SAM 결과가 비어 있음')
                 return np.zeros((h, w), dtype=bool)
 
             mask_data = results[0].masks.data  # shape: [N, H, W]
@@ -566,7 +524,7 @@ class FastSam3DNode(Node):
                 mask_data = mask_data.cpu().numpy()
 
             if len(mask_data) == 0:
-                self.get_logger().warn('FastSAM mask가 0개')
+                self.get_logger().warn('SAM mask가 0개')
                 return np.zeros((h, w), dtype=bool)
 
             mask = mask_data[0].astype(bool)
@@ -579,11 +537,11 @@ class FastSam3DNode(Node):
                     interpolation=cv2.INTER_NEAREST
                 ).astype(bool)
 
-            self.get_logger().info(f'FastSAM mask pixel count: {int(mask.sum())}')
+            self.get_logger().info(f'SAM mask pixel count: {int(mask.sum())}')
             return mask
 
         except Exception as e:
-            self.get_logger().error(f'FastSAM 실행 실패: {e}')
+            self.get_logger().error(f'SAM 실행 실패: {e}')
             return np.zeros((h, w), dtype=bool)
 
     def compute_3d_bbox(self, mask, depth, cam_info: CameraInfo):
@@ -700,7 +658,7 @@ class FastSam3DNode(Node):
             mask_img = (mask.astype(np.uint8) * 255)
             mask_msg = self.bridge.cv2_to_imgmsg(mask_img, encoding='mono8')
             mask_msg.header.stamp = header.stamp
-            mask_msg.header.frame_id = "zed_left_camera_optical_frame"
+            mask_msg.header.frame_id = self.last_camera_info.header.frame_id
             self.mask_pub.publish(mask_msg)
 
             # 2) overlay 이미지
@@ -714,11 +672,12 @@ class FastSam3DNode(Node):
             overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
             overlay_msg = self.bridge.cv2_to_imgmsg(overlay_bgr, encoding='bgr8')
             overlay_msg.header.stamp = header.stamp
-            overlay_msg.header.frame_id = "zed_left_camera_optical_frame"
+            overlay_msg.header.frame_id = self.last_camera_info.header.frame_id
             self.mask_overlay_pub.publish(overlay_msg)
 
         except Exception as e:
             self.get_logger().error(f'Mask topic publish 실패: {e}')
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -730,6 +689,7 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()

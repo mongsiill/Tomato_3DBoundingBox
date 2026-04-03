@@ -245,7 +245,7 @@ class FastSam3DNode(Node):
         marker = Marker()
         marker.header = header
         # camera_info.header.frame_id 를 그대로 사용 (예: zed_camera_center)
-        marker.header.frame_id = "zed_left_camera_optical_frame"
+        marker.header.frame_id = "zed_left_camera_frame_optical"
 
         marker.ns = "tomato"
         marker.id = 0

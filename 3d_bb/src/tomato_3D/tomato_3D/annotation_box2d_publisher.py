@@ -27,16 +27,16 @@ class AnnotationBox2DPublisher(Node):
         self.box_pub = self.create_publisher(Polygon, box2d_topic, 10)
         self.ack_sub = self.create_subscription(Empty, ack_topic, self.ack_callback, 10)
 
-        # 한 번만 publish 하고 끝낼 거라서, 타이머에서 바로 발행
+        # ack 받을 때까지 주기적으로 재발행
         self.annotation_path = annotation_path
-        self.published = False
         self.received_ack = False
+        self.publish_count = 0
 
         self.timer = self.create_timer(0.5, self.timer_callback)
         self.get_logger().info('AnnotationBox2DPublisher 시작')
 
     def timer_callback(self):
-        if self.published:
+        if self.received_ack:
             return
 
         if not os.path.exists(self.annotation_path):
@@ -65,8 +65,10 @@ class AnnotationBox2DPublisher(Node):
         poly.points.append(Point32(x=x_min, y=y_max, z=0.0))
 
         self.box_pub.publish(poly)
-        self.published = True
-        self.get_logger().info(f'박스 1개 발행 완료: {self.annotation_path}')
+        self.publish_count += 1
+        self.get_logger().info(
+            f'박스 발행 완료({self.publish_count}회): {self.annotation_path}'
+        )
 
     def ack_callback(self, msg: Empty):
         self.get_logger().info('box2d_ack 수신, 노드 종료')
